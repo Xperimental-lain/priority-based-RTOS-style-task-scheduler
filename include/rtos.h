@@ -30,6 +30,16 @@ extern "C" {
 #define RTOS_MAX_PRIORITIES 8      /* 0 = highest priority */
 #define RTOS_DEFAULT_STACK  (64 * 1024)
 
+typedef enum {
+    RTOS_OK = 0,
+    RTOS_ERR_INVALID = -1,
+    RTOS_ERR_FULL = -2,
+    RTOS_ERR_EMPTY = -3,
+    RTOS_ERR_TIMEOUT = -4,
+    RTOS_ERR_BUSY = -5,
+    RTOS_ERR_OWNER = -6
+} rtos_status_t;
+
 typedef void (*task_func_t)(void *arg);
 
 typedef enum {
@@ -47,7 +57,27 @@ typedef struct {
     int          priority;      /* 0 = highest */
     uint32_t     wake_tick;     /* tick at which a BLOCKED task becomes READY */
     uint32_t     run_count;     /* number of times scheduled, for stats */
+    uint32_t     switch_count;  /* number of context switches into this task */
 } task_info_t;
+
+typedef struct {
+    int owner;
+    unsigned recursion;
+} rtos_mutex_t;
+
+typedef struct {
+    int count;
+    int maximum;
+} rtos_sem_t;
+
+typedef struct {
+    unsigned char *buffer;
+    size_t item_size;
+    size_t capacity;
+    size_t head;
+    size_t tail;
+    size_t count;
+} rtos_queue_t;
 
 /* --- Kernel lifecycle --- */
 
@@ -75,11 +105,33 @@ void task_yield(void);
 /* Block the calling task for `ticks` scheduler ticks. */
 void task_delay(uint32_t ticks);
 
+/* Sleep until an absolute tick, avoiding drift in periodic tasks. */
+void task_delay_until(uint32_t *previous_wake, uint32_t period_ticks);
+
 /* Terminate the calling task. */
 void task_exit(void);
 
 /* Id of the currently running task. */
 int  task_self(void);
+
+/* --- Synchronization and IPC --- */
+
+void rtos_mutex_init(rtos_mutex_t *mutex);
+int  rtos_mutex_lock(rtos_mutex_t *mutex, uint32_t timeout_ticks);
+int  rtos_mutex_unlock(rtos_mutex_t *mutex);
+
+void rtos_sem_init(rtos_sem_t *sem, int initial_count, int maximum);
+int  rtos_sem_take(rtos_sem_t *sem, uint32_t timeout_ticks);
+int  rtos_sem_give(rtos_sem_t *sem);
+
+/* Queue storage is supplied by the caller: buffer must hold capacity items. */
+int  rtos_queue_init(rtos_queue_t *queue, void *buffer,
+                     size_t item_size, size_t capacity);
+int  rtos_queue_send(rtos_queue_t *queue, const void *item,
+                     uint32_t timeout_ticks);
+int  rtos_queue_receive(rtos_queue_t *queue, void *item,
+                        uint32_t timeout_ticks);
+size_t rtos_queue_count(const rtos_queue_t *queue);
 
 /* --- Introspection --- */
 

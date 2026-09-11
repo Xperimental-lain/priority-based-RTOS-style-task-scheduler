@@ -182,6 +182,7 @@ int task_create(const char *name, task_func_t func, void *arg,
                  int priority, size_t stack_size)
 {
     if (g_task_count >= RTOS_MAX_TASKS) return -1;
+    if (!func) return -1;
     if (priority < 0) priority = 0;
     if (priority >= RTOS_MAX_PRIORITIES) priority = RTOS_MAX_PRIORITIES - 1;
     if (stack_size == 0) stack_size = RTOS_DEFAULT_STACK;
@@ -219,6 +220,7 @@ static void switch_to(int idx)
     g_current = idx;
     g_tasks[idx].info.state = TASK_RUNNING;
     g_tasks[idx].info.run_count++;
+    g_tasks[idx].info.switch_count++;
     swapcontext(&g_sched_ctx, &g_tasks[idx].ctx);
 }
 
@@ -301,6 +303,24 @@ void task_delay(uint32_t ticks)
     swapcontext(&g_tasks[idx].ctx, &g_sched_ctx);
 }
 
+void task_delay_until(uint32_t *previous_wake, uint32_t period_ticks)
+{
+    if (!previous_wake || period_ticks == 0) {
+        task_yield();
+        return;
+    }
+
+    uint32_t now = g_tick_count;
+    uint32_t next = *previous_wake + period_ticks;
+    *previous_wake = next;
+
+    if ((int32_t)(next - now) > 0) {
+        task_delay(next - now);
+    } else {
+        task_yield();
+    }
+}
+
 void task_exit(void)
 {
     int idx = g_current;
@@ -314,8 +334,142 @@ int task_self(void)
     return g_current;
 }
 
+static int wait_for_condition(uint32_t start_tick, uint32_t timeout_ticks)
+{
+    if (timeout_ticks == 0) return 0;
+    if ((uint32_t)(g_tick_count - start_tick) >= timeout_ticks) return 0;
+    task_delay(1);
+    return 1;
+}
+
+void rtos_mutex_init(rtos_mutex_t *mutex)
+{
+    if (!mutex) return;
+    mutex->owner = -1;
+    mutex->recursion = 0;
+}
+
+int rtos_mutex_lock(rtos_mutex_t *mutex, uint32_t timeout_ticks)
+{
+    if (!mutex || g_current == -1) return RTOS_ERR_INVALID;
+    if (mutex->owner == g_current) {
+        mutex->recursion++;
+        return RTOS_OK;
+    }
+
+    uint32_t start = g_tick_count;
+    for (;;) {
+        if (mutex->owner == -1) {
+            mutex->owner = g_current;
+            mutex->recursion = 1;
+            return RTOS_OK;
+        }
+        if (!wait_for_condition(start, timeout_ticks)) return RTOS_ERR_TIMEOUT;
+    }
+}
+
+int rtos_mutex_unlock(rtos_mutex_t *mutex)
+{
+    if (!mutex || g_current == -1) return RTOS_ERR_INVALID;
+    if (mutex->owner != g_current) return RTOS_ERR_OWNER;
+    if (--mutex->recursion == 0) mutex->owner = -1;
+    return RTOS_OK;
+}
+
+void rtos_sem_init(rtos_sem_t *sem, int initial_count, int maximum)
+{
+    if (!sem) return;
+    if (maximum < 1) maximum = 1;
+    if (initial_count < 0) initial_count = 0;
+    if (initial_count > maximum) initial_count = maximum;
+    sem->count = initial_count;
+    sem->maximum = maximum;
+}
+
+int rtos_sem_take(rtos_sem_t *sem, uint32_t timeout_ticks)
+{
+    if (!sem || g_current == -1 || sem->maximum < 1) return RTOS_ERR_INVALID;
+    uint32_t start = g_tick_count;
+    for (;;) {
+        if (sem->count > 0) {
+            sem->count--;
+            return RTOS_OK;
+        }
+        if (!wait_for_condition(start, timeout_ticks)) return RTOS_ERR_TIMEOUT;
+    }
+}
+
+int rtos_sem_give(rtos_sem_t *sem)
+{
+    if (!sem || sem->maximum < 1) return RTOS_ERR_INVALID;
+    if (sem->count >= sem->maximum) return RTOS_ERR_FULL;
+    sem->count++;
+    return RTOS_OK;
+}
+
+int rtos_queue_init(rtos_queue_t *queue, void *buffer,
+                    size_t item_size, size_t capacity)
+{
+    if (!queue || !buffer || item_size == 0 || capacity == 0) {
+        return RTOS_ERR_INVALID;
+    }
+    queue->buffer = buffer;
+    queue->item_size = item_size;
+    queue->capacity = capacity;
+    queue->head = 0;
+    queue->tail = 0;
+    queue->count = 0;
+    return RTOS_OK;
+}
+
+int rtos_queue_send(rtos_queue_t *queue, const void *item,
+                    uint32_t timeout_ticks)
+{
+    if (!queue || !queue->buffer || !item || queue->capacity == 0 ||
+        g_current == -1) {
+        return RTOS_ERR_INVALID;
+    }
+    uint32_t start = g_tick_count;
+    for (;;) {
+        if (queue->count < queue->capacity) {
+            memcpy(queue->buffer + queue->tail * queue->item_size,
+                   item, queue->item_size);
+            queue->tail = (queue->tail + 1) % queue->capacity;
+            queue->count++;
+            return RTOS_OK;
+        }
+        if (!wait_for_condition(start, timeout_ticks)) return RTOS_ERR_TIMEOUT;
+    }
+}
+
+int rtos_queue_receive(rtos_queue_t *queue, void *item,
+                       uint32_t timeout_ticks)
+{
+    if (!queue || !queue->buffer || !item || queue->capacity == 0 ||
+        g_current == -1) {
+        return RTOS_ERR_INVALID;
+    }
+    uint32_t start = g_tick_count;
+    for (;;) {
+        if (queue->count > 0) {
+            memcpy(item, queue->buffer + queue->head * queue->item_size,
+                   queue->item_size);
+            queue->head = (queue->head + 1) % queue->capacity;
+            queue->count--;
+            return RTOS_OK;
+        }
+        if (!wait_for_condition(start, timeout_ticks)) return RTOS_ERR_TIMEOUT;
+    }
+}
+
+size_t rtos_queue_count(const rtos_queue_t *queue)
+{
+    return queue ? queue->count : 0;
+}
+
 int rtos_get_task_info(task_info_t *out, int max_tasks)
 {
+    if (!out || max_tasks <= 0) return 0;
     int n = g_task_count < max_tasks ? g_task_count : max_tasks;
     for (int i = 0; i < n; i++) out[i] = g_tasks[i].info;
     return n;
