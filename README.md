@@ -20,6 +20,7 @@ without any target hardware.
 - **Synchronization** — recursive mutexes and counting semaphores with tick timeouts
 - **Message passing** — fixed-size caller-owned queues with tick timeouts
 - **Direct wakeups** — synchronization waiters are queued per object and woken by signals
+- **Efficient delays** — ordinary sleeping tasks use a deadline min-heap
 - **Task lifecycle** — suspend, resume, delete, priority changes, and per-task lookup
 - **Event flags** — wait for any or all bits with timeouts
 - **Stack diagnostics** — canary checks and approximate high-water usage
@@ -161,8 +162,8 @@ This project is a Linux userspace simulation. The signal handler and
 `swapcontext()` path are intentionally educational and are not suitable for
 production kernel use. Priority inheritance covers the common single-mutex
 case; complex nested inheritance chains need a more complete inheritance
-graph. The scheduler still scans delayed tasks once per tick, while mutex,
-semaphore, and queue waits use direct per-object waiter lists.
+graph. Ordinary delayed tasks use a deadline min-heap, while mutex, semaphore,
+and queue waits use direct per-object waiter lists.
 
 ## Ideas to extend it
 

@@ -75,8 +75,65 @@ static int   g_ready_head[RTOS_MAX_PRIORITIES];
 static int   g_ready_tail[RTOS_MAX_PRIORITIES];
 static int   g_ready_count[RTOS_MAX_PRIORITIES];
 
+typedef struct {
+    uint32_t wake_tick;
+    int task_id;
+} sleep_entry_t;
+
+static sleep_entry_t g_sleep_heap[RTOS_MAX_TASKS];
+static size_t g_sleep_count;
+
 static void ready_push(int prio, int idx);
 static void trace_event(const char *event, int idx);
+
+static int tick_due(uint32_t wake_tick)
+{
+    return (int32_t)(g_tick_count - wake_tick) >= 0;
+}
+
+static void sleep_heap_push(int task_id, uint32_t wake_tick)
+{
+    size_t pos = g_sleep_count++;
+    g_sleep_heap[pos].task_id = task_id;
+    g_sleep_heap[pos].wake_tick = wake_tick;
+    while (pos > 0) {
+        size_t parent = (pos - 1) / 2;
+        if ((int32_t)(g_sleep_heap[parent].wake_tick - wake_tick) <= 0) break;
+        sleep_entry_t temp = g_sleep_heap[parent];
+        g_sleep_heap[parent] = g_sleep_heap[pos];
+        g_sleep_heap[pos] = temp;
+        pos = parent;
+    }
+}
+
+static sleep_entry_t sleep_heap_pop(void)
+{
+    sleep_entry_t result = g_sleep_heap[0];
+    g_sleep_count--;
+    if (g_sleep_count > 0) {
+        g_sleep_heap[0] = g_sleep_heap[g_sleep_count];
+        size_t pos = 0;
+        for (;;) {
+            size_t left = pos * 2 + 1;
+            size_t right = left + 1;
+            size_t smallest = pos;
+            if (left < g_sleep_count &&
+                g_sleep_heap[left].wake_tick < g_sleep_heap[smallest].wake_tick) {
+                smallest = left;
+            }
+            if (right < g_sleep_count &&
+                g_sleep_heap[right].wake_tick < g_sleep_heap[smallest].wake_tick) {
+                smallest = right;
+            }
+            if (smallest == pos) break;
+            sleep_entry_t temp = g_sleep_heap[pos];
+            g_sleep_heap[pos] = g_sleep_heap[smallest];
+            g_sleep_heap[smallest] = temp;
+            pos = smallest;
+        }
+    }
+    return result;
+}
 
 static void remove_waiter(int idx)
 {
@@ -195,9 +252,20 @@ static int all_tasks_terminated(void)
 
 static void wake_due_tasks(void)
 {
+    while (g_sleep_count > 0 && tick_due(g_sleep_heap[0].wake_tick)) {
+        sleep_entry_t entry = sleep_heap_pop();
+        tcb_t *task = &g_tasks[entry.task_id];
+        if (task->info.state == TASK_BLOCKED && task->wait_kind == WAIT_NONE &&
+            task->info.wake_tick == entry.wake_tick) {
+            task->info.state = TASK_READY;
+            ready_push(task->info.priority, entry.task_id);
+            trace_event("wake", entry.task_id);
+        }
+    }
     for (int i = 0; i < g_task_count; i++) {
         if (g_tasks[i].info.state == TASK_BLOCKED &&
-            g_tasks[i].info.wake_tick <= g_tick_count) {
+            g_tasks[i].wait_kind != WAIT_NONE &&
+            tick_due(g_tasks[i].info.wake_tick)) {
             remove_waiter(i);
             g_tasks[i].info.state = TASK_READY;
             ready_push(g_tasks[i].info.priority, i);
@@ -267,6 +335,7 @@ void rtos_init(unsigned tick_ms)
     g_running = 0;
     g_tick_ms = tick_ms ? tick_ms : 10;
     g_trace_stream = NULL;
+    g_sleep_count = 0;
 
     struct sigaction sa;
     memset(&sa, 0, sizeof(sa));
@@ -412,6 +481,9 @@ void task_delay(uint32_t ticks)
     if (idx == -1) return;
     g_tasks[idx].info.state = TASK_BLOCKED;
     g_tasks[idx].info.wake_tick = g_tick_count + ticks;
+    g_tasks[idx].wait_kind = WAIT_NONE;
+    g_tasks[idx].wait_object = NULL;
+    sleep_heap_push(idx, g_tasks[idx].info.wake_tick);
     trace_event("block", idx);
     swapcontext(&g_tasks[idx].ctx, &g_sched_ctx);
 }
@@ -458,7 +530,7 @@ int task_suspend(int task_id)
 {
     if (!valid_task_id(task_id) || task_id == g_current) return RTOS_ERR_INVALID;
     tcb_t *task = &g_tasks[task_id];
-    if (task->info.state != TASK_READY && task->info.state != TASK_BLOCKED) {
+    if (task->info.state != TASK_READY) {
         return RTOS_ERR_BUSY;
     }
     if (task->wait_kind != WAIT_NONE) return RTOS_ERR_BUSY;

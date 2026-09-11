@@ -10,6 +10,8 @@ static rtos_sem_t direct_sem;
 static rtos_queue_t test_queue;
 static rtos_event_t test_event;
 static int queue_storage[2];
+static int sleep_order[2];
+static int sleep_order_count;
 
 #define CHECK(condition, message) \
     do { \
@@ -93,6 +95,20 @@ static void direct_signaler(void *arg)
           "semaphore signal wakes a waiter directly");
 }
 
+static void long_sleep_task(void *arg)
+{
+    (void)arg;
+    task_delay(5);
+    sleep_order[sleep_order_count++] = 1;
+}
+
+static void short_sleep_task(void *arg)
+{
+    (void)arg;
+    task_delay(1);
+    sleep_order[sleep_order_count++] = 2;
+}
+
 int main(void)
 {
     rtos_init(1);
@@ -145,6 +161,16 @@ int main(void)
     CHECK(count == 8, "task introspection returns all tasks");
     CHECK(info[0].switch_count > 0, "task switch statistics are recorded");
     CHECK(rtos_queue_count(&test_queue) == 0, "queue is empty after receive");
+
+        sleep_order_count = 0;
+        rtos_init(1);
+        CHECK(task_create("long-sleep", long_sleep_task, NULL, 1, 0) >= 0,
+            "long sleep task creates");
+        CHECK(task_create("short-sleep", short_sleep_task, NULL, 1, 0) >= 0,
+            "short sleep task creates");
+        rtos_run();
+        CHECK(sleep_order_count == 2 && sleep_order[0] == 2 && sleep_order[1] == 1,
+            "delayed task heap wakes the earliest deadline first");
 
     if (failures != 0) {
         fprintf(stderr, "%d test(s) failed\n", failures);
