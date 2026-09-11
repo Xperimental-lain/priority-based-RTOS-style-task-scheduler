@@ -6,6 +6,7 @@
 static int failures;
 static rtos_mutex_t test_mutex;
 static rtos_sem_t test_sem;
+static rtos_sem_t direct_sem;
 static rtos_queue_t test_queue;
 static rtos_event_t test_event;
 static int queue_storage[2];
@@ -77,11 +78,27 @@ static void suspended_task(void *arg)
     (void)arg;
 }
 
+static void direct_waiter(void *arg)
+{
+    (void)arg;
+    CHECK(rtos_sem_take(&direct_sem, 20) == RTOS_OK,
+          "blocked semaphore waiter wakes from signal");
+}
+
+static void direct_signaler(void *arg)
+{
+    (void)arg;
+    task_delay(2);
+    CHECK(rtos_sem_give(&direct_sem) == RTOS_OK,
+          "semaphore signal wakes a waiter directly");
+}
+
 int main(void)
 {
     rtos_init(1);
     rtos_mutex_init(&test_mutex);
     rtos_sem_init(&test_sem, 0, 1);
+    rtos_sem_init(&direct_sem, 0, 1);
     rtos_event_init(&test_event);
     CHECK(rtos_queue_init(&test_queue, queue_storage, sizeof(queue_storage[0]), 2)
               == RTOS_OK,
@@ -97,6 +114,10 @@ int main(void)
             "event waiter task creates");
         CHECK(task_create("event-setter", event_setter, NULL, 1, 0) >= 0,
             "event setter task creates");
+            CHECK(task_create("direct-waiter", direct_waiter, NULL, 0, 0) >= 0,
+                "direct waiter task creates");
+            CHECK(task_create("direct-signaler", direct_signaler, NULL, 1, 0) >= 0,
+                "direct signaler task creates");
         int suspended_id = task_create("suspended", suspended_task, NULL, 3, 0);
         CHECK(suspended_id >= 0, "suspended task creates");
         CHECK(task_suspend(suspended_id) == RTOS_OK, "task suspends");
@@ -121,7 +142,7 @@ int main(void)
 
     task_info_t info[RTOS_MAX_TASKS];
     int count = rtos_get_task_info(info, RTOS_MAX_TASKS);
-    CHECK(count == 6, "task introspection returns all tasks");
+    CHECK(count == 8, "task introspection returns all tasks");
     CHECK(info[0].switch_count > 0, "task switch statistics are recorded");
     CHECK(rtos_queue_count(&test_queue) == 0, "queue is empty after receive");
 

@@ -19,6 +19,7 @@ without any target hardware.
 - **Periodic timing** — `task_delay_until()` avoids drift in recurring tasks
 - **Synchronization** — recursive mutexes and counting semaphores with tick timeouts
 - **Message passing** — fixed-size caller-owned queues with tick timeouts
+- **Direct wakeups** — synchronization waiters are queued per object and woken by signals
 - **Task lifecycle** — suspend, resume, delete, priority changes, and per-task lookup
 - **Event flags** — wait for any or all bits with timeouts
 - **Stack diagnostics** — canary checks and approximate high-water usage
@@ -55,6 +56,14 @@ make lib        # builds build/librtos.a for reuse by another program
 make run-c      # build + run the C demo
 make run-cpp    # build + run the C++ demo
 make clean
+```
+
+The same targets can be built with CMake:
+
+```sh
+cmake -S . -B build-cmake
+cmake --build build-cmake
+ctest --test-dir build-cmake --output-on-failure
 ```
 
 ## API quick reference (`include/rtos.h`)
@@ -150,10 +159,10 @@ of threading a raw `void*` around by hand.
 
 This project is a Linux userspace simulation. The signal handler and
 `swapcontext()` path are intentionally educational and are not suitable for
-production kernel use. Synchronization waits currently use bounded tick
-polling, which keeps the implementation small but is less efficient than a
-kernel wait list. Priority inheritance covers the common single-mutex case;
-complex nested inheritance chains need a more complete wait-queue design.
+production kernel use. Priority inheritance covers the common single-mutex
+case; complex nested inheritance chains need a more complete inheritance
+graph. The scheduler still scans delayed tasks once per tick, while mutex,
+semaphore, and queue waits use direct per-object waiter lists.
 
 ## Ideas to extend it
 

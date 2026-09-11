@@ -66,11 +66,15 @@ typedef struct {
     int owner;
     unsigned recursion;
     int owner_base_priority;
+    int waiters[RTOS_MAX_TASKS];
+    size_t waiter_count;
 } rtos_mutex_t;
 
 typedef struct {
     int count;
     int maximum;
+    int waiters[RTOS_MAX_TASKS];
+    size_t waiter_count;
 } rtos_sem_t;
 
 typedef struct {
@@ -80,6 +84,10 @@ typedef struct {
     size_t head;
     size_t tail;
     size_t count;
+    int send_waiters[RTOS_MAX_TASKS];
+    size_t send_waiter_count;
+    int receive_waiters[RTOS_MAX_TASKS];
+    size_t receive_waiter_count;
 } rtos_queue_t;
 
 typedef struct {

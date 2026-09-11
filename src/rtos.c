@@ -37,6 +37,14 @@
 #define RTOS_STACK_PATTERN 0xA5
 #define RTOS_STACK_CANARY 0xC3
 
+typedef enum {
+    WAIT_NONE,
+    WAIT_MUTEX,
+    WAIT_SEM,
+    WAIT_QUEUE_SEND,
+    WAIT_QUEUE_RECEIVE
+} wait_kind_t;
+
 typedef struct {
     task_info_t   info;
     ucontext_t    ctx;
@@ -46,6 +54,8 @@ typedef struct {
     void         *arg;
     int            base_priority;
     task_state_t   suspended_state;
+    wait_kind_t    wait_kind;
+    void          *wait_object;
 } tcb_t;
 
 /* --- Kernel state --- */
@@ -64,6 +74,76 @@ static int   g_ready_q[RTOS_MAX_PRIORITIES][RTOS_MAX_TASKS];
 static int   g_ready_head[RTOS_MAX_PRIORITIES];
 static int   g_ready_tail[RTOS_MAX_PRIORITIES];
 static int   g_ready_count[RTOS_MAX_PRIORITIES];
+
+static void ready_push(int prio, int idx);
+static void trace_event(const char *event, int idx);
+
+static void remove_waiter(int idx)
+{
+    tcb_t *task = &g_tasks[idx];
+    int *waiters = NULL;
+    size_t *count = NULL;
+
+    if (task->wait_kind == WAIT_MUTEX) {
+        rtos_mutex_t *mutex = task->wait_object;
+        waiters = mutex->waiters;
+        count = &mutex->waiter_count;
+    } else if (task->wait_kind == WAIT_SEM) {
+        rtos_sem_t *sem = task->wait_object;
+        waiters = sem->waiters;
+        count = &sem->waiter_count;
+    } else if (task->wait_kind == WAIT_QUEUE_SEND) {
+        rtos_queue_t *queue = task->wait_object;
+        waiters = queue->send_waiters;
+        count = &queue->send_waiter_count;
+    } else if (task->wait_kind == WAIT_QUEUE_RECEIVE) {
+        rtos_queue_t *queue = task->wait_object;
+        waiters = queue->receive_waiters;
+        count = &queue->receive_waiter_count;
+    }
+
+    if (waiters && count) {
+        for (size_t i = 0; i < *count; i++) {
+            if (waiters[i] == idx) {
+                memmove(&waiters[i], &waiters[i + 1],
+                        (*count - i - 1) * sizeof(waiters[0]));
+                (*count)--;
+                break;
+            }
+        }
+    }
+    task->wait_kind = WAIT_NONE;
+    task->wait_object = NULL;
+}
+
+static int add_waiter(int idx, wait_kind_t kind, void *object,
+                      int *waiters, size_t *count)
+{
+    if (!waiters || !count || *count >= RTOS_MAX_TASKS) return RTOS_ERR_FULL;
+    waiters[(*count)++] = idx;
+    g_tasks[idx].wait_kind = kind;
+    g_tasks[idx].wait_object = object;
+    return RTOS_OK;
+}
+
+static void wake_one(int *waiters, size_t *count)
+{
+    if (!waiters || !count || *count == 0) return;
+    size_t selected = 0;
+    for (size_t i = 1; i < *count; i++) {
+        if (g_tasks[waiters[i]].info.priority <
+            g_tasks[waiters[selected]].info.priority) {
+            selected = i;
+        }
+    }
+    int idx = waiters[selected];
+    remove_waiter(idx);
+    if (g_tasks[idx].info.state == TASK_BLOCKED) {
+        g_tasks[idx].info.state = TASK_READY;
+        ready_push(g_tasks[idx].info.priority, idx);
+        trace_event("wake", idx);
+    }
+}
 
 static void trace_event(const char *event, int idx)
 {
@@ -118,6 +198,7 @@ static void wake_due_tasks(void)
     for (int i = 0; i < g_task_count; i++) {
         if (g_tasks[i].info.state == TASK_BLOCKED &&
             g_tasks[i].info.wake_tick <= g_tick_count) {
+            remove_waiter(i);
             g_tasks[i].info.state = TASK_READY;
             ready_push(g_tasks[i].info.priority, i);
             trace_event("wake", i);
@@ -380,6 +461,7 @@ int task_suspend(int task_id)
     if (task->info.state != TASK_READY && task->info.state != TASK_BLOCKED) {
         return RTOS_ERR_BUSY;
     }
+    if (task->wait_kind != WAIT_NONE) return RTOS_ERR_BUSY;
     task->suspended_state = task->info.state;
     task->info.state = TASK_SUSPENDED;
     trace_event("suspend", task_id);
@@ -402,6 +484,7 @@ int task_delete(int task_id)
     if (!valid_task_id(task_id) || task_id == g_current) return RTOS_ERR_INVALID;
     tcb_t *task = &g_tasks[task_id];
     if (task->info.state == TASK_TERMINATED) return RTOS_ERR_BUSY;
+    if (task->wait_kind != WAIT_NONE) remove_waiter(task_id);
     free(task->stack);
     task->stack = NULL;
     task->info.state = TASK_TERMINATED;
@@ -462,12 +545,27 @@ static int wait_for_condition(uint32_t start_tick, uint32_t timeout_ticks)
     return 1;
 }
 
+static int block_on_wait(int idx, wait_kind_t kind, void *object,
+                         int *waiters, size_t *count, uint32_t deadline)
+{
+    if (add_waiter(idx, kind, object, waiters, count) != RTOS_OK) {
+        return RTOS_ERR_FULL;
+    }
+    g_tasks[idx].info.state = TASK_BLOCKED;
+    g_tasks[idx].info.wake_tick = deadline;
+    trace_event("block", idx);
+    swapcontext(&g_tasks[idx].ctx, &g_sched_ctx);
+    return RTOS_OK;
+}
+
 void rtos_mutex_init(rtos_mutex_t *mutex)
 {
     if (!mutex) return;
+    memset(mutex->waiters, 0, sizeof(mutex->waiters));
     mutex->owner = -1;
     mutex->recursion = 0;
     mutex->owner_base_priority = -1;
+    mutex->waiter_count = 0;
 }
 
 int rtos_mutex_lock(rtos_mutex_t *mutex, uint32_t timeout_ticks)
@@ -493,7 +591,14 @@ int rtos_mutex_lock(rtos_mutex_t *mutex, uint32_t timeout_ticks)
             }
             trace_event("priority_boost", mutex->owner);
         }
-        if (!wait_for_condition(start, timeout_ticks)) return RTOS_ERR_TIMEOUT;
+        if (timeout_ticks == 0 ||
+            (uint32_t)(g_tick_count - start) >= timeout_ticks) {
+            return RTOS_ERR_TIMEOUT;
+        }
+        if (block_on_wait(g_current, WAIT_MUTEX, mutex, mutex->waiters,
+                          &mutex->waiter_count, start + timeout_ticks) != RTOS_OK) {
+            return RTOS_ERR_FULL;
+        }
     }
 }
 
@@ -506,6 +611,7 @@ int rtos_mutex_unlock(rtos_mutex_t *mutex)
         mutex->owner = -1;
         g_tasks[owner].info.priority = mutex->owner_base_priority;
         mutex->owner_base_priority = -1;
+        wake_one(mutex->waiters, &mutex->waiter_count);
         trace_event("mutex_unlock", owner);
     }
     return RTOS_OK;
@@ -514,11 +620,13 @@ int rtos_mutex_unlock(rtos_mutex_t *mutex)
 void rtos_sem_init(rtos_sem_t *sem, int initial_count, int maximum)
 {
     if (!sem) return;
+    memset(sem->waiters, 0, sizeof(sem->waiters));
     if (maximum < 1) maximum = 1;
     if (initial_count < 0) initial_count = 0;
     if (initial_count > maximum) initial_count = maximum;
     sem->count = initial_count;
     sem->maximum = maximum;
+    sem->waiter_count = 0;
 }
 
 int rtos_sem_take(rtos_sem_t *sem, uint32_t timeout_ticks)
@@ -530,7 +638,14 @@ int rtos_sem_take(rtos_sem_t *sem, uint32_t timeout_ticks)
             sem->count--;
             return RTOS_OK;
         }
-        if (!wait_for_condition(start, timeout_ticks)) return RTOS_ERR_TIMEOUT;
+        if (timeout_ticks == 0 ||
+            (uint32_t)(g_tick_count - start) >= timeout_ticks) {
+            return RTOS_ERR_TIMEOUT;
+        }
+        if (block_on_wait(g_current, WAIT_SEM, sem, sem->waiters,
+                          &sem->waiter_count, start + timeout_ticks) != RTOS_OK) {
+            return RTOS_ERR_FULL;
+        }
     }
 }
 
@@ -539,6 +654,7 @@ int rtos_sem_give(rtos_sem_t *sem)
     if (!sem || sem->maximum < 1) return RTOS_ERR_INVALID;
     if (sem->count >= sem->maximum) return RTOS_ERR_FULL;
     sem->count++;
+    wake_one(sem->waiters, &sem->waiter_count);
     return RTOS_OK;
 }
 
@@ -554,6 +670,10 @@ int rtos_queue_init(rtos_queue_t *queue, void *buffer,
     queue->head = 0;
     queue->tail = 0;
     queue->count = 0;
+    memset(queue->send_waiters, 0, sizeof(queue->send_waiters));
+    memset(queue->receive_waiters, 0, sizeof(queue->receive_waiters));
+    queue->send_waiter_count = 0;
+    queue->receive_waiter_count = 0;
     return RTOS_OK;
 }
 
@@ -571,9 +691,18 @@ int rtos_queue_send(rtos_queue_t *queue, const void *item,
                    item, queue->item_size);
             queue->tail = (queue->tail + 1) % queue->capacity;
             queue->count++;
+            wake_one(queue->receive_waiters, &queue->receive_waiter_count);
             return RTOS_OK;
         }
-        if (!wait_for_condition(start, timeout_ticks)) return RTOS_ERR_TIMEOUT;
+        if (timeout_ticks == 0 ||
+            (uint32_t)(g_tick_count - start) >= timeout_ticks) {
+            return RTOS_ERR_TIMEOUT;
+        }
+        if (block_on_wait(g_current, WAIT_QUEUE_SEND, queue,
+                          queue->send_waiters, &queue->send_waiter_count,
+                          start + timeout_ticks) != RTOS_OK) {
+            return RTOS_ERR_FULL;
+        }
     }
 }
 
@@ -591,9 +720,18 @@ int rtos_queue_receive(rtos_queue_t *queue, void *item,
                    queue->item_size);
             queue->head = (queue->head + 1) % queue->capacity;
             queue->count--;
+            wake_one(queue->send_waiters, &queue->send_waiter_count);
             return RTOS_OK;
         }
-        if (!wait_for_condition(start, timeout_ticks)) return RTOS_ERR_TIMEOUT;
+        if (timeout_ticks == 0 ||
+            (uint32_t)(g_tick_count - start) >= timeout_ticks) {
+            return RTOS_ERR_TIMEOUT;
+        }
+        if (block_on_wait(g_current, WAIT_QUEUE_RECEIVE, queue,
+                          queue->receive_waiters, &queue->receive_waiter_count,
+                          start + timeout_ticks) != RTOS_OK) {
+            return RTOS_ERR_FULL;
+        }
     }
 }
 
