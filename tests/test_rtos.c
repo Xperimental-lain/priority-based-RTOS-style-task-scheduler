@@ -7,6 +7,7 @@ static int failures;
 static rtos_mutex_t test_mutex;
 static rtos_sem_t test_sem;
 static rtos_queue_t test_queue;
+static rtos_event_t test_event;
 static int queue_storage[2];
 
 #define CHECK(condition, message) \
@@ -55,11 +56,33 @@ static void timeout_task(void *arg)
           "empty semaphore times out");
 }
 
+static void event_waiter(void *arg)
+{
+    (void)arg;
+    CHECK(rtos_event_wait(&test_event, 0x04, 1, 20) == RTOS_OK,
+          "event waiter receives all requested bits");
+    CHECK(task_stack_check(task_self()) == RTOS_OK, "task stack canary is intact");
+}
+
+static void event_setter(void *arg)
+{
+    (void)arg;
+    task_delay(2);
+    CHECK(rtos_event_set(&test_event, 0x04) == RTOS_OK,
+          "event setter signals the waiter");
+}
+
+static void suspended_task(void *arg)
+{
+    (void)arg;
+}
+
 int main(void)
 {
     rtos_init(1);
     rtos_mutex_init(&test_mutex);
     rtos_sem_init(&test_sem, 0, 1);
+    rtos_event_init(&test_event);
     CHECK(rtos_queue_init(&test_queue, queue_storage, sizeof(queue_storage[0]), 2)
               == RTOS_OK,
           "queue initializes");
@@ -70,11 +93,35 @@ int main(void)
           "consumer task creates");
     CHECK(task_create("timeout", timeout_task, NULL, 2, 0) >= 0,
           "timeout task creates");
+        CHECK(task_create("event-waiter", event_waiter, NULL, 0, 0) >= 0,
+            "event waiter task creates");
+        CHECK(task_create("event-setter", event_setter, NULL, 1, 0) >= 0,
+            "event setter task creates");
+        int suspended_id = task_create("suspended", suspended_task, NULL, 3, 0);
+        CHECK(suspended_id >= 0, "suspended task creates");
+        CHECK(task_suspend(suspended_id) == RTOS_OK, "task suspends");
+        task_info_t suspended_info;
+        CHECK(task_get_info(suspended_id, &suspended_info) == RTOS_OK &&
+              suspended_info.state == TASK_SUSPENDED,
+            "suspended task is reported correctly");
+        CHECK(task_resume(suspended_id) == RTOS_OK, "task resumes");
+
+        FILE *trace = tmpfile();
+        CHECK(trace != NULL, "trace file opens");
+        rtos_trace_enable(trace);
     rtos_run();
+        rtos_trace_disable();
+
+        if (trace) {
+            fseek(trace, 0, SEEK_SET);
+          int first = fgetc(trace);
+          CHECK(first == 't', "trace output has a CSV header");
+          fclose(trace);
+        }
 
     task_info_t info[RTOS_MAX_TASKS];
     int count = rtos_get_task_info(info, RTOS_MAX_TASKS);
-    CHECK(count == 3, "task introspection returns all tasks");
+    CHECK(count == 6, "task introspection returns all tasks");
     CHECK(info[0].switch_count > 0, "task switch statistics are recorded");
     CHECK(rtos_queue_count(&test_queue) == 0, "queue is empty after receive");
 

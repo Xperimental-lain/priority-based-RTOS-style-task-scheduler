@@ -21,6 +21,7 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include <stdio.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -47,6 +48,7 @@ typedef enum {
     TASK_READY,
     TASK_RUNNING,
     TASK_BLOCKED,   /* delayed / sleeping */
+    TASK_SUSPENDED,
     TASK_TERMINATED
 } task_state_t;
 
@@ -63,6 +65,7 @@ typedef struct {
 typedef struct {
     int owner;
     unsigned recursion;
+    int owner_base_priority;
 } rtos_mutex_t;
 
 typedef struct {
@@ -78,6 +81,10 @@ typedef struct {
     size_t tail;
     size_t count;
 } rtos_queue_t;
+
+typedef struct {
+    uint32_t bits;
+} rtos_event_t;
 
 /* --- Kernel lifecycle --- */
 
@@ -114,6 +121,15 @@ void task_exit(void);
 /* Id of the currently running task. */
 int  task_self(void);
 
+/* Task lifecycle and diagnostics. Task deletion is for non-running tasks. */
+int  task_suspend(int task_id);
+int  task_resume(int task_id);
+int  task_delete(int task_id);
+int  task_set_priority(int task_id, int priority);
+int  task_get_info(int task_id, task_info_t *out);
+int  task_stack_check(int task_id);
+size_t task_stack_used(int task_id);
+
 /* --- Synchronization and IPC --- */
 
 void rtos_mutex_init(rtos_mutex_t *mutex);
@@ -132,6 +148,17 @@ int  rtos_queue_send(rtos_queue_t *queue, const void *item,
 int  rtos_queue_receive(rtos_queue_t *queue, void *item,
                         uint32_t timeout_ticks);
 size_t rtos_queue_count(const rtos_queue_t *queue);
+
+/* Event bits provide lightweight task notifications. */
+void rtos_event_init(rtos_event_t *event);
+int  rtos_event_set(rtos_event_t *event, uint32_t bits);
+int  rtos_event_clear(rtos_event_t *event, uint32_t bits);
+int  rtos_event_wait(rtos_event_t *event, uint32_t bits,
+                     int wait_all, uint32_t timeout_ticks);
+
+/* Trace output is CSV-like: tick,event,task,name. */
+void rtos_trace_enable(FILE *stream);
+void rtos_trace_disable(void);
 
 /* --- Introspection --- */
 

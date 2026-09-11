@@ -19,7 +19,12 @@ without any target hardware.
 - **Periodic timing** — `task_delay_until()` avoids drift in recurring tasks
 - **Synchronization** — recursive mutexes and counting semaphores with tick timeouts
 - **Message passing** — fixed-size caller-owned queues with tick timeouts
+- **Task lifecycle** — suspend, resume, delete, priority changes, and per-task lookup
+- **Event flags** — wait for any or all bits with timeouts
+- **Stack diagnostics** — canary checks and approximate high-water usage
+- **Priority inheritance** — mutex contention temporarily boosts the owner
 - **Task statistics** — run counts and context-switch counts through task introspection
+- **Scheduler tracing** — optional CSV trace output for context switches and task state changes
 - **Context switching via `ucontext`** — each task has its own stack and saved machine state
 
 See the big comment block at the top of `src/rtos.c` for the full
@@ -46,6 +51,7 @@ rtos_scheduler/
 make            # builds build/demo_c and build/demo_cpp
 make test       # builds and runs the scheduler integration tests
 make sanitize   # runs tests with AddressSanitizer and UBSan
+make lib        # builds build/librtos.a for reuse by another program
 make run-c      # build + run the C demo
 make run-cpp    # build + run the C++ demo
 make clean
@@ -95,6 +101,33 @@ for (;;) {
 }
 ```
 
+Tasks can be inspected and controlled by id. A task may only be deleted when
+it is not the currently running task:
+
+```c
+task_info_t info;
+task_get_info(task_id, &info);
+task_suspend(task_id);
+task_set_priority(task_id, 2);
+task_resume(task_id);
+```
+
+Event flags provide lightweight notifications:
+
+```c
+rtos_event_t events;
+rtos_event_init(&events);
+rtos_event_wait(&events, DATA_READY | ERROR, 0, 100);
+```
+
+Tracing writes CSV records to a caller-owned `FILE *`:
+
+```c
+rtos_trace_enable(stderr);
+rtos_run();
+rtos_trace_disable();
+```
+
 `priority` 0 is highest; `RTOS_MAX_PRIORITIES` (default 8) levels are
 available. Tasks at the same priority round-robin.
 
@@ -117,12 +150,13 @@ of threading a raw `void*` around by hand.
 
 This project is a Linux userspace simulation. The signal handler and
 `swapcontext()` path are intentionally educational and are not suitable for
-production kernel use. The synchronization primitives use scheduler ticks
-for bounded waits, but they do not yet provide priority inheritance.
+production kernel use. Synchronization waits currently use bounded tick
+polling, which keeps the implementation small but is less efficient than a
+kernel wait list. Priority inheritance covers the common single-mutex case;
+complex nested inheritance chains need a more complete wait-queue design.
 
 ## Ideas to extend it
 
-- Stack overflow detection (canary word at the low end of each task stack)
 - Port the same `rtos.h` API onto real hardware (swap `ucontext`+`SIGALRM`
   for a Cortex-M `PendSV`/`SysTick` context switch) — the task-facing API
   wouldn't need to change at all

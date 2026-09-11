@@ -33,6 +33,10 @@
 #include <sys/time.h>
 #include <unistd.h>
 
+#define RTOS_STACK_CANARY_SIZE 16
+#define RTOS_STACK_PATTERN 0xA5
+#define RTOS_STACK_CANARY 0xC3
+
 typedef struct {
     task_info_t   info;
     ucontext_t    ctx;
@@ -40,6 +44,8 @@ typedef struct {
     size_t        stack_size;
     task_func_t   func;
     void         *arg;
+    int            base_priority;
+    task_state_t   suspended_state;
 } tcb_t;
 
 /* --- Kernel state --- */
@@ -51,12 +57,25 @@ static volatile sig_atomic_t g_tick_pending = 0;
 static uint32_t         g_tick_count = 0;
 static volatile sig_atomic_t g_running = 0;
 static unsigned          g_tick_ms = 10;
+static FILE             *g_trace_stream = NULL;
 
 /* Simple ready queue: array of task indices per priority level, FIFO. */
 static int   g_ready_q[RTOS_MAX_PRIORITIES][RTOS_MAX_TASKS];
 static int   g_ready_head[RTOS_MAX_PRIORITIES];
 static int   g_ready_tail[RTOS_MAX_PRIORITIES];
 static int   g_ready_count[RTOS_MAX_PRIORITIES];
+
+static void trace_event(const char *event, int idx)
+{
+    if (!g_trace_stream) return;
+    if (idx >= 0 && idx < g_task_count) {
+        fprintf(g_trace_stream, "%u,%s,%d,%s\n", g_tick_count, event,
+                idx, g_tasks[idx].info.name);
+    } else {
+        fprintf(g_trace_stream, "%u,%s,-1,scheduler\n", g_tick_count, event);
+    }
+    fflush(g_trace_stream);
+}
 
 static void ready_push(int prio, int idx)
 {
@@ -78,8 +97,9 @@ static int ready_pop(int prio)
 static int pick_next(void)
 {
     for (int p = 0; p < RTOS_MAX_PRIORITIES; p++) {
-        if (g_ready_count[p] > 0) {
-            return ready_pop(p);
+        while (g_ready_count[p] > 0) {
+            int idx = ready_pop(p);
+            if (g_tasks[idx].info.state == TASK_READY) return idx;
         }
     }
     return -1; /* nothing ready */
@@ -100,6 +120,7 @@ static void wake_due_tasks(void)
             g_tasks[i].info.wake_tick <= g_tick_count) {
             g_tasks[i].info.state = TASK_READY;
             ready_push(g_tasks[i].info.priority, i);
+            trace_event("wake", i);
         }
     }
 }
@@ -164,6 +185,7 @@ void rtos_init(unsigned tick_ms)
     g_tick_pending = 0;
     g_running = 0;
     g_tick_ms = tick_ms ? tick_ms : 10;
+    g_trace_stream = NULL;
 
     struct sigaction sa;
     memset(&sa, 0, sizeof(sa));
@@ -195,6 +217,8 @@ int task_create(const char *name, task_func_t func, void *arg,
     strncpy(t->info.name, name ? name : "task", sizeof(t->info.name) - 1);
     t->info.state = TASK_READY;
     t->info.priority = priority;
+    t->base_priority = priority;
+    t->suspended_state = TASK_READY;
     t->func = func;
     t->arg = arg;
 
@@ -202,6 +226,10 @@ int task_create(const char *name, task_func_t func, void *arg,
     t->stack = malloc(stack_size);
     if (!t->stack) { g_task_count--; return -1; }
 
+    memset(t->stack, RTOS_STACK_PATTERN, stack_size);
+    if (stack_size >= RTOS_STACK_CANARY_SIZE) {
+        memset(t->stack, RTOS_STACK_CANARY, RTOS_STACK_CANARY_SIZE);
+    }
     getcontext(&t->ctx);
     t->ctx.uc_stack.ss_sp = t->stack;
     t->ctx.uc_stack.ss_size = stack_size;
@@ -209,6 +237,7 @@ int task_create(const char *name, task_func_t func, void *arg,
     makecontext(&t->ctx, task_trampoline, 0);
 
     ready_push(priority, idx);
+    trace_event("create", idx);
     return idx;
 }
 
@@ -221,6 +250,7 @@ static void switch_to(int idx)
     g_tasks[idx].info.state = TASK_RUNNING;
     g_tasks[idx].info.run_count++;
     g_tasks[idx].info.switch_count++;
+    trace_event("switch", idx);
     swapcontext(&g_sched_ctx, &g_tasks[idx].ctx);
 }
 
@@ -291,6 +321,7 @@ void task_yield(void)
     int idx = g_current;
     if (idx == -1) return; /* not in a task context */
     g_tasks[idx].info.state = TASK_READY;
+    trace_event("yield", idx);
     swapcontext(&g_tasks[idx].ctx, &g_sched_ctx);
 }
 
@@ -300,6 +331,7 @@ void task_delay(uint32_t ticks)
     if (idx == -1) return;
     g_tasks[idx].info.state = TASK_BLOCKED;
     g_tasks[idx].info.wake_tick = g_tick_count + ticks;
+    trace_event("block", idx);
     swapcontext(&g_tasks[idx].ctx, &g_sched_ctx);
 }
 
@@ -326,12 +358,100 @@ void task_exit(void)
     int idx = g_current;
     if (idx == -1) return;
     g_tasks[idx].info.state = TASK_TERMINATED;
+    trace_event("exit", idx);
     swapcontext(&g_tasks[idx].ctx, &g_sched_ctx);
 }
 
 int task_self(void)
 {
     return g_current;
+}
+
+static int valid_task_id(int task_id)
+{
+    return task_id >= 0 && task_id < g_task_count &&
+           g_tasks[task_id].info.state != TASK_UNUSED;
+}
+
+int task_suspend(int task_id)
+{
+    if (!valid_task_id(task_id) || task_id == g_current) return RTOS_ERR_INVALID;
+    tcb_t *task = &g_tasks[task_id];
+    if (task->info.state != TASK_READY && task->info.state != TASK_BLOCKED) {
+        return RTOS_ERR_BUSY;
+    }
+    task->suspended_state = task->info.state;
+    task->info.state = TASK_SUSPENDED;
+    trace_event("suspend", task_id);
+    return RTOS_OK;
+}
+
+int task_resume(int task_id)
+{
+    if (!valid_task_id(task_id)) return RTOS_ERR_INVALID;
+    tcb_t *task = &g_tasks[task_id];
+    if (task->info.state != TASK_SUSPENDED) return RTOS_ERR_BUSY;
+    task->info.state = task->suspended_state;
+    if (task->info.state == TASK_READY) ready_push(task->info.priority, task_id);
+    trace_event("resume", task_id);
+    return RTOS_OK;
+}
+
+int task_delete(int task_id)
+{
+    if (!valid_task_id(task_id) || task_id == g_current) return RTOS_ERR_INVALID;
+    tcb_t *task = &g_tasks[task_id];
+    if (task->info.state == TASK_TERMINATED) return RTOS_ERR_BUSY;
+    free(task->stack);
+    task->stack = NULL;
+    task->info.state = TASK_TERMINATED;
+    trace_event("delete", task_id);
+    return RTOS_OK;
+}
+
+int task_set_priority(int task_id, int priority)
+{
+    if (!valid_task_id(task_id)) return RTOS_ERR_INVALID;
+    if (priority < 0) priority = 0;
+    if (priority >= RTOS_MAX_PRIORITIES) priority = RTOS_MAX_PRIORITIES - 1;
+    tcb_t *task = &g_tasks[task_id];
+    task->base_priority = priority;
+    task->info.priority = priority;
+    if (task->info.state == TASK_READY) ready_push(priority, task_id);
+    return RTOS_OK;
+}
+
+int task_get_info(int task_id, task_info_t *out)
+{
+    if (!valid_task_id(task_id) || !out) return RTOS_ERR_INVALID;
+    *out = g_tasks[task_id].info;
+    return RTOS_OK;
+}
+
+int task_stack_check(int task_id)
+{
+    if (!valid_task_id(task_id) || !g_tasks[task_id].stack ||
+        g_tasks[task_id].stack_size < RTOS_STACK_CANARY_SIZE) {
+        return RTOS_ERR_INVALID;
+    }
+    for (size_t i = 0; i < RTOS_STACK_CANARY_SIZE; i++) {
+        if ((unsigned char)g_tasks[task_id].stack[i] != RTOS_STACK_CANARY) {
+            return RTOS_ERR_INVALID;
+        }
+    }
+    return RTOS_OK;
+}
+
+size_t task_stack_used(int task_id)
+{
+    if (!valid_task_id(task_id) || !g_tasks[task_id].stack ||
+        g_tasks[task_id].stack_size <= RTOS_STACK_CANARY_SIZE) return 0;
+    size_t used_start = RTOS_STACK_CANARY_SIZE;
+    while (used_start < g_tasks[task_id].stack_size &&
+           (unsigned char)g_tasks[task_id].stack[used_start] == RTOS_STACK_PATTERN) {
+        used_start++;
+    }
+    return g_tasks[task_id].stack_size - used_start;
 }
 
 static int wait_for_condition(uint32_t start_tick, uint32_t timeout_ticks)
@@ -347,6 +467,7 @@ void rtos_mutex_init(rtos_mutex_t *mutex)
     if (!mutex) return;
     mutex->owner = -1;
     mutex->recursion = 0;
+    mutex->owner_base_priority = -1;
 }
 
 int rtos_mutex_lock(rtos_mutex_t *mutex, uint32_t timeout_ticks)
@@ -362,7 +483,15 @@ int rtos_mutex_lock(rtos_mutex_t *mutex, uint32_t timeout_ticks)
         if (mutex->owner == -1) {
             mutex->owner = g_current;
             mutex->recursion = 1;
+            mutex->owner_base_priority = g_tasks[g_current].base_priority;
             return RTOS_OK;
+        }
+        if (g_tasks[mutex->owner].info.priority > g_tasks[g_current].info.priority) {
+            g_tasks[mutex->owner].info.priority = g_tasks[g_current].info.priority;
+            if (g_tasks[mutex->owner].info.state == TASK_READY) {
+                ready_push(g_tasks[mutex->owner].info.priority, mutex->owner);
+            }
+            trace_event("priority_boost", mutex->owner);
         }
         if (!wait_for_condition(start, timeout_ticks)) return RTOS_ERR_TIMEOUT;
     }
@@ -372,7 +501,13 @@ int rtos_mutex_unlock(rtos_mutex_t *mutex)
 {
     if (!mutex || g_current == -1) return RTOS_ERR_INVALID;
     if (mutex->owner != g_current) return RTOS_ERR_OWNER;
-    if (--mutex->recursion == 0) mutex->owner = -1;
+    if (--mutex->recursion == 0) {
+        int owner = mutex->owner;
+        mutex->owner = -1;
+        g_tasks[owner].info.priority = mutex->owner_base_priority;
+        mutex->owner_base_priority = -1;
+        trace_event("mutex_unlock", owner);
+    }
     return RTOS_OK;
 }
 
@@ -465,6 +600,54 @@ int rtos_queue_receive(rtos_queue_t *queue, void *item,
 size_t rtos_queue_count(const rtos_queue_t *queue)
 {
     return queue ? queue->count : 0;
+}
+
+void rtos_event_init(rtos_event_t *event)
+{
+    if (event) event->bits = 0;
+}
+
+int rtos_event_set(rtos_event_t *event, uint32_t bits)
+{
+    if (!event || bits == 0) return RTOS_ERR_INVALID;
+    event->bits |= bits;
+    return RTOS_OK;
+}
+
+int rtos_event_clear(rtos_event_t *event, uint32_t bits)
+{
+    if (!event || bits == 0) return RTOS_ERR_INVALID;
+    event->bits &= ~bits;
+    return RTOS_OK;
+}
+
+int rtos_event_wait(rtos_event_t *event, uint32_t bits,
+                    int wait_all, uint32_t timeout_ticks)
+{
+    if (!event || bits == 0 || g_current == -1) return RTOS_ERR_INVALID;
+    uint32_t start = g_tick_count;
+    for (;;) {
+        uint32_t matched = event->bits & bits;
+        if ((wait_all && matched == bits) || (!wait_all && matched != 0)) {
+            event->bits &= ~matched;
+            return RTOS_OK;
+        }
+        if (!wait_for_condition(start, timeout_ticks)) return RTOS_ERR_TIMEOUT;
+    }
+}
+
+void rtos_trace_enable(FILE *stream)
+{
+    g_trace_stream = stream;
+    if (g_trace_stream) {
+        fprintf(g_trace_stream, "tick,event,task,name\n");
+        fflush(g_trace_stream);
+    }
+}
+
+void rtos_trace_disable(void)
+{
+    g_trace_stream = NULL;
 }
 
 int rtos_get_task_info(task_info_t *out, int max_tasks)
